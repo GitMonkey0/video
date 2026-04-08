@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 import argparse
+import concurrent.futures
 import json
 import os
 import re
@@ -25,6 +26,7 @@ DEFAULT_ENDPOINT = os.getenv(
 DEFAULT_API_VERSION = os.getenv("AZURE_OPENAI_API_VERSION", "2024-03-01-preview")
 DEFAULT_MODEL = os.getenv("AZURE_OPENAI_MODEL", "gpt-5.4-2026-03-05")
 DEFAULT_LOGID = os.getenv("AZURE_OPENAI_LOGID", "arxiv-qa-cli")
+DEFAULT_MAX_OUTPUT_TOKENS = int(os.getenv("AZURE_OPENAI_MAX_OUTPUT_TOKENS", "32768"))
 
 
 @dataclass
@@ -52,6 +54,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--model", default=DEFAULT_MODEL)
     parser.add_argument("--logid", default=DEFAULT_LOGID)
     parser.add_argument(
+        "--max-output-tokens",
+        type=int,
+        default=DEFAULT_MAX_OUTPUT_TOKENS,
+        help="Maximum output tokens sent to the Responses API.",
+    )
+    parser.add_argument(
         "--max-chars",
         type=int,
         default=120000,
@@ -62,6 +70,12 @@ def parse_args() -> argparse.Namespace:
         choices=("text", "json"),
         default="text",
         help="Output format.",
+    )
+    parser.add_argument(
+        "--workers",
+        type=int,
+        default=16,
+        help="Maximum number of tasks processed concurrently.",
     )
     return parser.parse_args()
 
@@ -170,6 +184,7 @@ def answer_query(
     client: openai.AzureOpenAI,
     model: str,
     logid: str,
+    max_output_tokens: int,
     paper_url: str,
     paper_text: str,
     query: str,
@@ -197,11 +212,52 @@ def answer_query(
                 ],
             }
         ],
+        max_output_tokens=max_output_tokens,
         extra_headers={
             "X-TT-LOGID": logid,
         },
     )
     return response_to_text(response)
+
+
+def process_task(
+    task: Task,
+    api_key: str,
+    endpoint: str,
+    api_version: str,
+    model: str,
+    logid: str,
+    max_output_tokens: int,
+    max_chars: int,
+) -> dict[str, str]:
+    pdf_path: Path | None = None
+    try:
+        client = create_client(api_key, endpoint, api_version)
+        pdf_path = download_pdf(task.pdf_url)
+        markdown = extract_markdown(pdf_path)
+        answer = answer_query(
+            client=client,
+            model=model,
+            logid=logid,
+            max_output_tokens=max_output_tokens,
+            paper_url=task.source_url,
+            paper_text=trim_content(markdown, max_chars),
+            query=task.query,
+        )
+        return {
+            "url": task.source_url,
+            "query": task.query,
+            "answer": answer,
+        }
+    except Exception as exc:
+        return {
+            "url": task.source_url,
+            "query": task.query,
+            "answer": f"ERROR: {exc}",
+        }
+    finally:
+        if pdf_path and pdf_path.exists():
+            pdf_path.unlink()
 
 
 def render_text(results: list[dict[str, str]]) -> str:
@@ -222,41 +278,30 @@ def render_text(results: list[dict[str, str]]) -> str:
 
 def main() -> int:
     args = parse_args()
-    client = create_client(args.api_key, args.endpoint, args.api_version)
     tasks = build_tasks(args.task)
-    results: list[dict[str, str]] = []
+    if args.workers < 1:
+        raise ValueError("--workers must be at least 1")
 
-    for task in tasks:
-        pdf_path: Path | None = None
-        try:
-            pdf_path = download_pdf(task.pdf_url)
-            markdown = extract_markdown(pdf_path)
-            answer = answer_query(
-                client=client,
-                model=args.model,
-                logid=args.logid,
-                paper_url=task.source_url,
-                paper_text=trim_content(markdown, args.max_chars),
-                query=task.query,
+    results: list[dict[str, str]] = []
+    max_workers = min(args.workers, len(tasks))
+
+    with concurrent.futures.ProcessPoolExecutor(max_workers=max_workers) as executor:
+        futures = [
+            executor.submit(
+                process_task,
+                task,
+                args.api_key,
+                args.endpoint,
+                args.api_version,
+                args.model,
+                args.logid,
+                args.max_output_tokens,
+                args.max_chars,
             )
-            results.append(
-                {
-                    "url": task.source_url,
-                    "query": task.query,
-                    "answer": answer,
-                }
-            )
-        except Exception as exc:
-            results.append(
-                {
-                    "url": task.source_url,
-                    "query": task.query,
-                    "answer": f"ERROR: {exc}",
-                }
-            )
-        finally:
-            if pdf_path and pdf_path.exists():
-                pdf_path.unlink()
+            for task in tasks
+        ]
+        for future in futures:
+            results.append(future.result())
 
     if args.format == "json":
         print(json.dumps(results, ensure_ascii=False, indent=2))
